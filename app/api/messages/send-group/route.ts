@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { twilioClient, TWILIO_PHONE } from "@/lib/twilio";
+import { getVendelClient } from "@/lib/vendel";
 
 export async function POST(req: NextRequest) {
   const { groupId, body } = await req.json();
@@ -20,6 +20,9 @@ export async function POST(req: NextRequest) {
   });
 
   if (!group) return NextResponse.json({ error: "Group not found" }, { status: 404 });
+  if (group.members.length === 0) {
+    return NextResponse.json({ error: "No eligible recipients (all opted out or group empty)" }, { status: 422 });
+  }
 
   const campaign = await prisma.campaign.create({
     data: {
@@ -30,71 +33,60 @@ export async function POST(req: NextRequest) {
     },
   });
 
-  // Send asynchronously — fire and update campaign in background
-  // In production this would be enqueued via Vercel Queues
-  let sentCount = 0;
-  let failedCount = 0;
+  const phones = group.members.map(({ contact }) => contact.phone);
 
-  const sends = group.members.map(async ({ contact }) => {
-    let conversation = await prisma.conversation.findFirst({
-      where: { contactId: contact.id, status: "open" },
-      orderBy: { openedAt: "desc" },
-    });
-    if (!conversation) {
-      conversation = await prisma.conversation.create({ data: { contactId: contact.id } });
-    }
+  try {
+    // Single Vendel API call for all recipients
+    const result = await getVendelClient().sendSms(phones, body);
 
-    const message = await prisma.message.create({
-      data: {
-        senderType: "admin",
-        recipientId: contact.id,
-        groupId,
-        conversationId: conversation.id,
-        body,
-        direction: "outbound",
-        status: "queued",
-      },
-    });
+    // Create per-contact message records mapped by index
+    const messageRecords = await Promise.all(
+      group.members.map(async ({ contact }, i) => {
+        let conversation = await prisma.conversation.findFirst({
+          where: { contactId: contact.id, status: "open" },
+          orderBy: { openedAt: "desc" },
+        });
+        if (!conversation) {
+          conversation = await prisma.conversation.create({ data: { contactId: contact.id } });
+        }
 
-    try {
-      const result = await twilioClient.messages.create({
-        to: contact.phone,
-        from: TWILIO_PHONE,
-        body,
-        statusCallback: `${process.env.NEXT_PUBLIC_APP_URL}/api/messages/status-webhook`,
-      });
+        const message = await prisma.message.create({
+          data: {
+            senderType: "admin",
+            recipientId: contact.id,
+            groupId,
+            conversationId: conversation.id,
+            body,
+            direction: "outbound",
+            providerMessageId: result.message_ids[i] ?? null,
+            status: "sending",
+          },
+        });
 
-      await prisma.message.update({
-        where: { id: message.id },
-        data: { providerMessageId: result.sid, status: "sent" },
-      });
+        await prisma.campaignRecipient.create({
+          data: { campaignId: campaign.id, contactId: contact.id, messageId: message.id },
+        });
 
-      await prisma.campaignRecipient.create({
-        data: { campaignId: campaign.id, contactId: contact.id, messageId: message.id },
-      });
+        return message;
+      })
+    );
 
-      sentCount++;
-    } catch {
-      await prisma.message.update({
-        where: { id: message.id },
-        data: { status: "failed" },
-      });
-      failedCount++;
-    }
-  });
-
-  // Respond immediately; let sends complete in background (Vercel Fluid Compute keeps alive)
-  Promise.all(sends).then(async () => {
     await prisma.campaign.update({
       where: { id: campaign.id },
-      data: {
-        status: failedCount > 0 && sentCount === 0 ? "partial_failure" : "completed",
-        sentCount,
-        failedCount,
-        completedAt: new Date(),
-      },
+      data: { status: "completed", sentCount: messageRecords.length, completedAt: new Date() },
     });
-  });
 
-  return NextResponse.json({ campaignId: campaign.id, totalCount: group.members.length });
+    return NextResponse.json({
+      campaignId: campaign.id,
+      batchId: result.batch_id,
+      totalCount: result.recipients_count,
+    });
+  } catch (err: unknown) {
+    const error = err as { message?: string };
+    await prisma.campaign.update({
+      where: { id: campaign.id },
+      data: { status: "partial_failure", failedCount: group.members.length, completedAt: new Date() },
+    });
+    return NextResponse.json({ error: "Failed to send group SMS", detail: error.message }, { status: 502 });
+  }
 }

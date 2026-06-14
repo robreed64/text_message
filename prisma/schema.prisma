@@ -120,6 +120,8 @@ enum MessageDirection {
 
 enum MessageStatus {
   queued
+  assigned
+  sending
   sent
   delivered
   failed

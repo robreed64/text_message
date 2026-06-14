@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { twilioClient, TWILIO_PHONE } from "@/lib/twilio";
+import { getVendelClient, isOptOutMessage } from "@/lib/vendel";
 
 export async function POST(req: NextRequest) {
   const { contactId, body } = await req.json();
@@ -14,6 +14,9 @@ export async function POST(req: NextRequest) {
   if (contact.optedOut) {
     return NextResponse.json({ error: "Contact has opted out" }, { status: 422 });
   }
+  if (isOptOutMessage(body)) {
+    return NextResponse.json({ error: "Message body matches an opt-out keyword" }, { status: 400 });
+  }
 
   // Find or create open conversation
   let conversation = await prisma.conversation.findFirst({
@@ -21,9 +24,7 @@ export async function POST(req: NextRequest) {
     orderBy: { openedAt: "desc" },
   });
   if (!conversation) {
-    conversation = await prisma.conversation.create({
-      data: { contactId },
-    });
+    conversation = await prisma.conversation.create({ data: { contactId } });
   }
 
   const message = await prisma.message.create({
@@ -38,16 +39,12 @@ export async function POST(req: NextRequest) {
   });
 
   try {
-    const result = await twilioClient.messages.create({
-      to: contact.phone,
-      from: TWILIO_PHONE,
-      body,
-      statusCallback: `${process.env.NEXT_PUBLIC_APP_URL}/api/messages/status-webhook`,
-    });
+    const result = await getVendelClient().sendSms([contact.phone], body);
+    const providerMessageId = result.message_ids[0] ?? null;
 
     await prisma.message.update({
       where: { id: message.id },
-      data: { providerMessageId: result.sid, status: "sent" },
+      data: { providerMessageId, status: "sending" },
     });
 
     await prisma.conversation.update({
@@ -55,13 +52,13 @@ export async function POST(req: NextRequest) {
       data: { lastMessageAt: new Date() },
     });
 
-    return NextResponse.json({ messageId: message.id, sid: result.sid });
+    return NextResponse.json({ messageId: message.id, providerMessageId, batchId: result.batch_id });
   } catch (err: unknown) {
-    const error = err as { code?: string; message?: string };
+    const error = err as { message?: string };
     await prisma.message.update({
       where: { id: message.id },
-      data: { status: "failed", errorCode: String(error.code ?? ""), errorMessage: error.message },
+      data: { status: "failed", errorMessage: error.message },
     });
-    return NextResponse.json({ error: "Failed to send SMS" }, { status: 502 });
+    return NextResponse.json({ error: "Failed to send SMS", detail: error.message }, { status: 502 });
   }
 }

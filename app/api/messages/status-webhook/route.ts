@@ -1,41 +1,44 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { validateTwilioWebhook } from "@/lib/twilio";
-type MessageStatus = "queued" | "sent" | "delivered" | "failed" | "undelivered";
+import { verifyVendelWebhook } from "@/lib/vendel";
+
+type StatusPayload = {
+  event: "sms_sent" | "sms_delivered" | "sms_failed";
+  message_id: string;
+  status: string;
+  to: string;
+  body: string;
+  error_message?: string;
+  sent_at?: string;
+  delivered_at?: string;
+  timestamp: string;
+};
+
+const eventToStatus: Record<string, "sent" | "delivered" | "failed"> = {
+  sms_sent: "sent",
+  sms_delivered: "delivered",
+  sms_failed: "failed",
+};
 
 export async function POST(req: NextRequest) {
-  const formData = await req.formData();
-  const params: Record<string, string> = {};
-  formData.forEach((value, key) => { params[key] = String(value); });
+  const rawBody = Buffer.from(await req.arrayBuffer());
+  const signature = req.headers.get("x-webhook-signature") ?? "";
 
-  const signature = req.headers.get("x-twilio-signature") ?? "";
-  const url = `${process.env.NEXT_PUBLIC_APP_URL}/api/messages/status-webhook`;
-  if (!validateTwilioWebhook(signature, url, params)) {
+  if (!verifyVendelWebhook(rawBody, signature)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 403 });
   }
 
-  const sid = params["MessageSid"];
-  const rawStatus = params["MessageStatus"];
-  const errorCode = params["ErrorCode"];
-
-  const statusMap: Record<string, MessageStatus> = {
-    queued: "queued",
-    sent: "sent",
-    delivered: "delivered",
-    failed: "failed",
-    undelivered: "undelivered",
-  };
-
-  const status = statusMap[rawStatus];
-  if (!status) return new Response("ok");
+  const payload: StatusPayload = JSON.parse(rawBody.toString());
+  const status = eventToStatus[payload.event];
+  if (!status) return NextResponse.json({ ok: true });
 
   await prisma.message.updateMany({
-    where: { providerMessageId: sid },
+    where: { providerMessageId: payload.message_id },
     data: {
       status,
-      ...(errorCode && { errorCode }),
+      ...(payload.error_message && { errorMessage: payload.error_message }),
     },
   });
 
-  return new Response("ok");
+  return NextResponse.json({ ok: true });
 }

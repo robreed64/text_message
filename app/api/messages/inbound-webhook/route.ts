@@ -1,28 +1,32 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { validateTwilioWebhook, isOptOutMessage } from "@/lib/twilio";
+import { verifyVendelWebhook, isOptOutMessage } from "@/lib/vendel";
+
+type SmsReceivedPayload = {
+  event: "sms_received";
+  from: string;
+  body: string;
+  message_id: string;
+  timestamp: string;
+};
 
 export async function POST(req: NextRequest) {
-  const formData = await req.formData();
-  const params: Record<string, string> = {};
-  formData.forEach((value, key) => { params[key] = String(value); });
+  const rawBody = Buffer.from(await req.arrayBuffer());
+  const signature = req.headers.get("x-webhook-signature") ?? "";
 
-  // Validate Twilio signature
-  const signature = req.headers.get("x-twilio-signature") ?? "";
-  const url = `${process.env.NEXT_PUBLIC_APP_URL}/api/messages/inbound-webhook`;
-  if (!validateTwilioWebhook(signature, url, params)) {
+  if (!verifyVendelWebhook(rawBody, signature)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 403 });
   }
 
-  const fromPhone = params["From"];
-  const body = params["Body"] ?? "";
-  const providerMessageId = params["MessageSid"];
-
-  const contact = await prisma.contact.findUnique({ where: { phone: fromPhone } });
-  if (!contact) {
-    // Unknown number — store message without linking
-    return new Response("<Response/>", { headers: { "Content-Type": "text/xml" } });
+  const payload: SmsReceivedPayload = JSON.parse(rawBody.toString());
+  if (payload.event !== "sms_received") {
+    return NextResponse.json({ ok: true });
   }
+
+  const { from, body, message_id } = payload;
+
+  const contact = await prisma.contact.findUnique({ where: { phone: from } });
+  if (!contact) return NextResponse.json({ ok: true });
 
   // Handle opt-out
   if (isOptOutMessage(body)) {
@@ -30,10 +34,7 @@ export async function POST(req: NextRequest) {
       where: { id: contact.id },
       data: { optedOut: true, optedOutAt: new Date() },
     });
-    return new Response(
-      "<Response><Message>You have been unsubscribed. Reply START to resubscribe.</Message></Response>",
-      { headers: { "Content-Type": "text/xml" } }
-    );
+    return NextResponse.json({ ok: true });
   }
 
   // Find or open conversation
@@ -59,7 +60,7 @@ export async function POST(req: NextRequest) {
       body,
       direction: "inbound",
       threadRootId: threadRoot?.id ?? null,
-      providerMessageId,
+      providerMessageId: message_id,
       status: "delivered",
     },
   });
@@ -69,5 +70,5 @@ export async function POST(req: NextRequest) {
     data: { lastMessageAt: new Date() },
   });
 
-  return new Response("<Response/>", { headers: { "Content-Type": "text/xml" } });
+  return NextResponse.json({ ok: true });
 }
